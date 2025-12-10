@@ -1,0 +1,409 @@
+import sys
+!{sys.executable} -m pip install flask sqlalchemy flask-migrate flask-jwt-extended flask-dance[google] qrcode pillow flask-sqlalchemy
+
+"""
+Full-featured QR Generator & Scanner Flask App
+- SQLite (SQLAlchemy) persistence for users and history
+- Flask-Migrate support for DB migrations
+- JWT-based API tokens (Flask-JWT-Extended)
+- Optional OAuth (Flask-Dance) placeholders for Google login
+- Theme (dark/light) switcher persisted per-user
+- Analytics dashboard (counts & recent activity)
+- REST endpoints suitable for mobile/web clients
+- Dockerfile + Procfile for deployment
+- Instructions to wrap the web app into an Android WebView APK using Capacitor
+
+NOTE: This file is a single-file example for ease of testing. For production, split into modules and templates/static files.
+
+Requirements (pip):
+flask sqlalchemy flask-migrate flask-jwt-extended flask-dance[qoauth] qrcode pillow html5-qrcode
+
+Run (development):
+export FLASK_APP=app.py
+export FLASK_ENV=development
+flask db init
+flask db migrate -m "init"
+flask db upgrade
+flask run
+
+Placeholders / Secrets:
+- Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET in environment to enable Google OAuth.
+- Set JWT_SECRET_KEY in environment.
+
+"""
+
+from flask import Flask, render_template_string, request, send_file, redirect, session, url_for, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_dance.contrib.google import make_google_blueprint, google
+import qrcode
+import io
+import base64
+from datetime import datetime, timedelta
+import os
+
+# ---------- Configuration ----------
+app = Flask(name)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///qrapp.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'super-secret-jwt')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secret-session')
+
+# OAuth (placeholder)
+OAUTH_CLIENT_ID = os.environ.get('OAUTH_CLIENT_ID')
+OAUTH_CLIENT_SECRET = os.environ.get('OAUTH_CLIENT_SECRET')
+if OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET:
+    google_bp = make_google_blueprint(client_id=OAUTH_CLIENT_ID,
+                                      client_secret=OAUTH_CLIENT_SECRET,
+                                      scope=["profile", "email"],
+                                      redirect_url='/oauth_callback')
+    app.register_blueprint(google_bp, url_prefix="/login")
+
+# ---------- Extensions ----------
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+jwt = JWTManager(app)
+
+# ---------- Models ----------
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(120), unique=True, nullable=False)
+    password = db.Column(db.String(256))  # plaintext for demo only — hash in prod
+    theme = db.Column(db.String(10), default='light')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class History(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    action = db.Column(db.String(50))  # 'generated' or 'scanned'
+    content = db.Column(db.Text)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+# ---------- Helpers ----------
+def generate_qr_bytes(data):
+    img = qrcode.make(data)
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    return buffer.getvalue()
+
+# ---------- Templates (single-file for demo) ----------
+BASE_HTML = '''
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QR Pro App</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+  <style>
+    body[data-theme='dark'] { background: #121212; color: #eaeaea; }
+    .card { border-radius: 12px; }
+  </style>
+</head>
+<body data-theme="{{ theme }}">
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-3">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="/">QR Pro</a>
+    <div class="d-flex">
+      {% if user %}
+        <span class="me-2">{{ user.username }}</span>
+        <a href="/logout" class="btn btn-outline-light btn-sm me-2">Logout</a>
+      {% else %}
+        <a href="/login" class="btn btn-outline-light btn-sm me-2">Login</a>
+      {% endif %}
+    </div>
+  </div>
+</nav>
+<div class="container">
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}
+      {% for m in messages %}
+        <div class="alert alert-info">{{ m }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  {{ body|safe }}
+</div>
+<script>
+  function toggleTheme(){
+    let current = document.body.getAttribute('data-theme');
+    let next = current === 'dark' ? 'light' : 'dark';
+    document.body.setAttribute('data-theme', next);
+    fetch('/set_theme', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({theme:next})});
+  }
+</script>
+</body>
+</html>
+'''
+
+HOME_BODY = '''
+<div class="row justify-content-center">
+  <div class="col-md-8">
+    <div class="card p-4 shadow-sm mb-3">
+      <h4>Generate QR</h4>
+      <form method="POST" action="/generate">
+        <div class="mb-2"><input name="data" class="form-control" placeholder="Text or URL" required></div>
+        <div class="d-flex gap-2">
+          <button class="btn btn-primary">Generate</button>
+          <button type="button" class="btn btn-secondary" onclick="toggleTheme()">Toggle Theme</button>
+        </div>
+      </form>
+      {% if qr_b64 %}
+        <div class="text-center mt-3">
+          <img src="data:image/png;base64,{{ qr_b64 }}" style="width:200px;border-radius:8px;border:4px solid white;">
+          <div class="mt-2"><a href="/download?data={{ raw }}" class="btn btn-success btn-sm">Download</a></div>
+        </div>
+      {% endif %}
+    </div>
+
+    <div class="card p-3 shadow-sm">
+      <h4>Scan QR (camera)</h4>
+      <div id="reader"></div>
+      <div class="mt-2" id="scan-result">No scan yet</div>
+    </div>
+
+  </div>
+</div>
+<script>
+function onScanSuccess(decodedText, decodedResult) {
+  document.getElementById('scan-result').innerHTML = '<b>Scanned:</b> ' + decodedText;
+  fetch('/api/save_scan', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({content:decodedText})});
+}
+new Html5QrcodeScanner('reader', {fps:10, qrbox:250}).render(onScanSuccess);
+</script>
+'''
+
+DASHBOARD_BODY = '''
+<div class="row">
+  <div class="col-md-8">
+    <div class="card p-3 mb-3">
+      <h4>Analytics</h4>
+      <p>Total users: {{ stats.users }}</p>
+      <p>Total histories: {{ stats.histories }}</p>
+      <p>Generated (last 24h): {{ stats.gen_24h }}</p>
+      <p>Scanned (last 24h): {{ stats.scan_24h }}</p>
+    </div>
+
+    <div class="card p-3">
+      <h5>Recent Activity</h5>
+      <ul class="list-group">
+        {% for h in recent %}
+          <li class="list-group-item">{{ h.timestamp }} — {{ h.action }} — {{ h.content }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+</div>
+'''
+
+# ---------- Routes ----------
+from flask import flash
+
+@app.route('/')
+def index():
+    user = None
+    theme = 'light'
+    if 'user_id' in session:
+        user = User.query.get(session['user_id'])
+        theme = user.theme if user else 'light'
+    return render_template_string(BASE_HTML, body=render_template_string(HOME_BODY, qr_b64=None, raw=None), user=user, theme=theme)
+
+@app.route('/generate', methods=['POST'])
+def generate():
+    data = request.form.get('data')
+    if not data:
+        return redirect('/')
+    img_bytes = generate_qr_bytes(data)
+    b64 = base64.b64encode(img_bytes).decode('utf-8')
+    # store history if logged in
+    user = None
+    if 'user_id' in session:
+        user = User.query.get(session['user_id'])
+        db.session.add(History(user_id=user.id, action='generated', content=data))
+        db.session.commit()
+    return render_template_string(BASE_HTML, body=render_template_string(HOME_BODY, qr_b64=b64, raw=data), user=user, theme=(user.theme if user else 'light'))
+
+@app.route('/download')
+def download():
+    data = request.args.get('data')
+    img_bytes = generate_qr_bytes(data)
+    buffer = io.BytesIO(img_bytes)
+    buffer.seek(0)
+    return send_file(buffer, as_attachment=True, download_name='qr.png', mimetype='image/png')
+
+@app.route('/set_theme', methods=['POST'])
+def set_theme():
+    payload = request.get_json() or {}
+    theme = payload.get('theme','light')
+    if 'user_id' in session:
+        user = User.query.get(session['user_id'])
+        user.theme = theme
+        db.session.commit()
+    return ('',204)
+
+# ---------- Auth (simple session + JWT API) ----------
+@app.route('/login', methods=['GET','POST'])
+def login():
+    if request.method=='GET':
+        return render_template_string(BASE_HTML, body='''
+        <div class="col-md-4 mx-auto">
+          <div class="card p-3">
+            <h4>Login</h4>
+            <form method='POST'>
+              <input class='form-control mb-2' name='username' placeholder='username' required>
+              <input class='form-control mb-2' name='password' placeholder='password' required>
+              <button class='btn btn-primary w-100'>Login</button>
+            </form>
+            <div class='mt-2'>No account? <a href='/register'>Register</a></div>
+            {% if oauth %}
+              <div class='mt-2'><a class='btn btn-outline-secondary' href='{{ oauth_url }}'>Login with Google</a></div>
+            {% endif %}
+          </div>
+        </div>
+        ''', user=None, theme='light', oauth=(OAUTH_CLIENT_ID is not None), oauth_url=url_for('google.login') if OAUTH_CLIENT_ID else None)
+
+    username = request.form['username']
+    password = request.form['password']
+    user = User.query.filter_by(username=username).first()
+    if user and user.password == password:
+        session['user_id'] = user.id
+        flash('Logged in')
+        return redirect('/')
+    flash('Invalid credentials')
+    return redirect('/login')
+
+@app.route('/register', methods=['GET','POST'])
+def register():
+    if request.method=='GET':
+        return render_template_string(BASE_HTML, body='''
+        <div class="col-md-4 mx-auto">
+          <div class="card p-3">
+            <h4>Register</h4>
+            <form method='POST'>
+              <input class='form-control mb-2' name='username' placeholder='username' required>
+              <input class='form-control mb-2' name='password' placeholder='password' required>
+              <button class='btn btn-success w-100'>Create</button>
+            </form>
+          </div>
+        </div>
+        ''', user=None, theme='light')
+    username = request.form['username']
+    password = request.form['password']
+    if User.query.filter_by(username=username).first():
+        flash('User exists')
+        return redirect('/register')
+    user = User(username=username, password=password)
+    db.session.add(user)
+    db.session.commit()
+    session['user_id'] = user.id
+    flash('Account created')
+    return redirect('/')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/')
+
+# ---------- API endpoints (JWT) ----------
+@app.route('/api/token', methods=['POST'])
+def api_token():
+    data = request.get_json() or {}
+    username = data.get('username')
+    password = data.get('password')
+    user = User.query.filter_by(username=username).first()
+    if not user or user.password != password:
+        return jsonify({'msg':'Bad username or password'}), 401
+    token = create_access_token(identity=user.id, expires_delta=timedelta(hours=12))
+    return jsonify({'access_token': token})
+
+@app.route('/api/generate', methods=['POST'])
+@jwt_required()
+def api_generate():
+    uid = get_jwt_identity()
+    payload = request.get_json() or {}
+    content = payload.get('content')
+    if not content:
+        return jsonify({'msg':'missing content'}), 400
+    img_bytes = generate_qr_bytes(content)
+    b64 = base64.b64encode(img_bytes).decode('utf-8')
+    db.session.add(History(user_id=uid, action='generated', content=content))
+    db.session.commit()
+    return jsonify({'qr_base64': b64})
+
+@app.route('/api/save_scan', methods=['POST'])
+def api_save_scan():
+    payload = request.get_json() or {}
+    content = payload.get('content')
+    uid = session.get('user_id')
+    db.session.add(History(user_id=uid, action='scanned', content=content))
+    db.session.commit()
+    return ('',204)
+
+# ---------- Analytics ----------
+@app.route('/dashboard')
+def dashboard():
+    # simple analytics
+    users_count = User.query.count()
+    histories_count = History.query.count()
+    since = datetime.utcnow() - timedelta(days=1)
+    gen_24h = History.query.filter(History.action=='generated', History.timestamp>=since).count()
+    scan_24h = History.query.filter(History.action=='scanned', History.timestamp>=since).count()
+    recent = History.query.order_by(History.timestamp.desc()).limit(10).all()
+    data = { 'users': users_count, 'histories': histories_count, 'gen_24h': gen_24h, 'scan_24h': scan_24h }
+    return render_template_string(BASE_HTML, body=render_template_string(DASHBOARD_BODY, stats=data, recent=recent), user=User.query.get(session.get('user_id')) if session.get('user_id') else None, theme='light')
+
+# ---------- OAuth callback (optional) ----------
+@app.route('/oauth_callback')
+def oauth_callback():
+    if not google.authorized:
+        return redirect(url_for('google.login'))
+    resp = google.get('/oauth2/v2/userinfo')
+    assert resp.ok, resp.text
+    info = resp.json()
+    email = info.get('email')
+    user = User.query.filter_by(username=email).first()
+    if not user:
+        user = User(username=email, password='')
+        db.session.add(user)
+        db.session.commit()
+    session['user_id'] = user.id
+    return redirect('/')
+
+# ---------- Dockerfile / Procfile (as strings to copy) ----------
+DOCKERFILE = '''
+FROM python:3.11-slim
+WORKDIR /app
+COPY . /app
+RUN pip install --no-cache-dir -r requirements.txt
+ENV FLASK_APP=app.py
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:app"]
+'''
+
+PROCFILE = 'web: gunicorn app:app'
+
+# ---------- Android wrapper instructions ----------
+ANDROID_INSTRUCTIONS = '''
+To wrap into an Android APK using Capacitor:
+1. Install Node + npm and Capacitor globally.
+2. Build your frontend assets (if separating). For this web app, you can point Capacitor's WebView to your deployed URL or bundle a static build.
+3. Run: npx @capacitor/cli create
+4. Add Android: npx cap add android
+5. Sync and open Android Studio: npx cap open android
+6. Build APK in Android Studio (Release) and sign it.
+
+Alternatively, use Trusted Web Activity for PWAs or an Android WebView project.
+'''
+
+# ---------- App entry ----------
+if name == 'main':
+    # Print helpful info
+    print('\n--- QR Pro App ---')
+    print('DB:', app.config['SQLALCHEMY_DATABASE_URI'])
+    print('To run migrations: flask db init; flask db migrate; flask db upgrade')
+    print('Dockerfile and Procfile strings are included as variables in this file for copy-paste.')
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
+
+# End of file
