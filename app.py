@@ -2,32 +2,50 @@ from flask import Flask, render_template_string, request, send_file, redirect, s
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_wtf.csrf import CSRFProtect
+from werkzeug.security import generate_password_hash, check_password_hash
 import qrcode
 import io
 import base64
 from datetime import datetime, timedelta
 import os
+import secrets
 
 app = Flask(__name__)
+
+secret_key = os.environ.get('SESSION_SECRET')
+if not secret_key:
+    secret_key = secrets.token_hex(32)
+
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///qrapp.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', os.environ.get('SESSION_SECRET', 'super-secret-jwt'))
-app.config['SECRET_KEY'] = os.environ.get('SESSION_SECRET', 'super-secret-session')
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', secret_key)
+app.config['SECRET_KEY'] = secret_key
+app.config['WTF_CSRF_ENABLED'] = True
 
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 jwt = JWTManager(app)
+csrf = CSRFProtect(app)
 
 class User(db.Model):
+    __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(120), unique=True, nullable=False)
-    password = db.Column(db.String(256))
+    password_hash = db.Column(db.String(256))
     theme = db.Column(db.String(10), default='light')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
 class History(db.Model):
+    __tablename__ = 'history'
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     action = db.Column(db.String(50))
     content = db.Column(db.Text)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
@@ -105,6 +123,7 @@ HOME_BODY = '''
     <div class="card p-4 shadow-sm mb-4">
       <h4 class="mb-3">Generate QR Code</h4>
       <form method="POST" action="/generate">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="mb-3">
           <input name="data" class="form-control form-control-lg" placeholder="Enter text or URL" required>
         </div>
@@ -204,6 +223,7 @@ LOGIN_BODY = '''
   <div class="card p-4 shadow-sm">
     <h4 class="mb-3">Login</h4>
     <form method="POST">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input class="form-control mb-3" name="username" placeholder="Username" required>
       <input class="form-control mb-3" name="password" type="password" placeholder="Password" required>
       <button class="btn btn-primary w-100">Login</button>
@@ -220,6 +240,7 @@ REGISTER_BODY = '''
   <div class="card p-4 shadow-sm">
     <h4 class="mb-3">Create Account</h4>
     <form method="POST">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input class="form-control mb-3" name="username" placeholder="Username" required>
       <input class="form-control mb-3" name="password" type="password" placeholder="Password" required>
       <button class="btn btn-success w-100">Register</button>
@@ -268,6 +289,7 @@ def download():
     return send_file(buffer, as_attachment=True, download_name='qr.png', mimetype='image/png')
 
 @app.route('/set_theme', methods=['POST'])
+@csrf.exempt
 def set_theme():
     payload = request.get_json() or {}
     theme = payload.get('theme', 'light')
@@ -285,7 +307,7 @@ def login():
     username = request.form['username']
     password = request.form['password']
     user = User.query.filter_by(username=username).first()
-    if user and user.password == password:
+    if user and user.check_password(password):
         session['user_id'] = user.id
         flash('Logged in successfully!')
         return redirect('/')
@@ -301,7 +323,8 @@ def register():
     if User.query.filter_by(username=username).first():
         flash('Username already exists')
         return redirect('/register')
-    user = User(username=username, password=password)
+    user = User(username=username)
+    user.set_password(password)
     db.session.add(user)
     db.session.commit()
     session['user_id'] = user.id
@@ -315,17 +338,19 @@ def logout():
     return redirect('/')
 
 @app.route('/api/token', methods=['POST'])
+@csrf.exempt
 def api_token():
     data = request.get_json() or {}
     username = data.get('username')
     password = data.get('password')
     user = User.query.filter_by(username=username).first()
-    if not user or user.password != password:
+    if not user or not user.check_password(password):
         return jsonify({'msg': 'Bad username or password'}), 401
     token = create_access_token(identity=user.id, expires_delta=timedelta(hours=12))
     return jsonify({'access_token': token})
 
 @app.route('/api/generate', methods=['POST'])
+@csrf.exempt
 @jwt_required()
 def api_generate():
     uid = get_jwt_identity()
@@ -340,6 +365,7 @@ def api_generate():
     return jsonify({'qr_base64': b64})
 
 @app.route('/api/save_scan', methods=['POST'])
+@csrf.exempt
 def api_save_scan():
     payload = request.get_json() or {}
     content = payload.get('content')
