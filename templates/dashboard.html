@@ -1,0 +1,50 @@
+<div class="row justify-content-center">
+  <div class="col-md-10">
+    <h2 class="mb-4">Analytics Dashboard</h2>
+    <div class="row mb-4">
+      <div class="col-md-3">
+        <div class="card p-3 text-center shadow-sm">
+          <h3 class="text-primary">{{ stats.users }}</h3>
+          <p class="mb-0">Total Users</p>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="card p-3 text-center shadow-sm">
+          <h3 class="text-success">{{ stats.histories }}</h3>
+          <p class="mb-0">Total Actions</p>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="card p-3 text-center shadow-sm">
+          <h3 class="text-info">{{ stats.gen_24h }}</h3>
+          <p class="mb-0">Generated (24h)</p>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="card p-3 text-center shadow-sm">
+          <h3 class="text-warning">{{ stats.scan_24h }}</h3>
+          <p class="mb-0">Scanned (24h)</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card p-4 shadow-sm">
+      <h5 class="mb-3">Recent Activity</h5>
+      {% if recent %}
+        <ul class="list-group">
+          {% for h in recent %}
+            <li class="list-group-item d-flex justify-content-between align-items-center">
+              <span>
+                <span class="badge {% if h.action == 'generated' %}bg-primary{% else %}bg-warning{% endif %} me-2">{{ h.action }}</span>
+                {{ h.content[:50] }}{% if h.content|length > 50 %}...{% endif %}
+              </span>
+              <small class="text-muted">{{ h.timestamp.strftime('%Y-%m-%d %H:%M') }}</small>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="text-muted">No activity yet</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
